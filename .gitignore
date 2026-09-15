@@ -1,0 +1,28 @@
+# Большие файлы — не в репозиторий.
+# model.pkl весит 118 МБ и не проходит лимит GitHub в 100 МБ на файл,
+# его создаёт notebook. Исходный датасет весит 46 МБ.
+model.pkl
+data/real_estate_data.csv
+
+# Служебные файлы сборки notebook и документа — в репозитории не нужны
+nb_part1.py
+nb_part2.py
+build_nb.py
+build_doc.py
+results.json
+
+# Развёртывание
+amvera.yml
+requirements-app.txt
+DEPLOY.md
+
+# Материалы к защите
+Текст выступления.docx
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+exec.log
+tmp_size_check.pkl
+.venv/
+venv/
