@@ -12,7 +12,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-APP_VERSION = '1.0'
+APP_VERSION = '2.0'
 
 # пути считаем от самого файла, чтобы приложение запускалось из любой папки
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -76,11 +76,12 @@ if package is None:
 # ----------------------------------------------------------------------
 # Сборка признаков — ровно так же, как при обучении
 # ----------------------------------------------------------------------
-def make_features(size, rooms, halls, building_age, total_floors, floor,
+def make_features(listing_type, size, rooms, halls, building_age, total_floors, floor,
                   sub_type, heating_type, city, county):
     total_rooms = rooms + halls
 
     row = {
+        'listing_type': listing_type,
         'size': size,
         'building_age_num': building_age,
         'total_floors': total_floors,
@@ -139,8 +140,8 @@ def check_input(size, rooms, halls, total_floors, floor, building_age):
 # Заголовок и вкладки
 # ----------------------------------------------------------------------
 st.title('🏠 Оценка стоимости недвижимости')
-st.caption('Модель обучена на объявлениях площадки Zingat (Турция, 2018–2019). '
-           'Цены — в турецких лирах (TRY).')
+st.caption('Модель обучена на объявлениях площадки Zingat (Турция, 2018–2019) '
+           'о продаже и аренде жилья. Цены — в турецких лирах (TRY).')
 
 tab_predict, tab_dashboard, tab_help = st.tabs(
     ['📊 Прогноз цены', '📈 Дашборд', 'ℹ️ Справка'])
@@ -151,6 +152,10 @@ tab_predict, tab_dashboard, tab_help = st.tabs(
 # ======================================================================
 with tab_predict:
     st.header('Введите характеристики объекта')
+
+    listing_type = st.radio('Тип объявления', [1, 2], horizontal=True,
+                            format_func=lambda x: package['listing_types'][x])
+    is_sale = listing_type == 1
 
     col1, col2, col3 = st.columns(3)
 
@@ -206,19 +211,22 @@ with tab_predict:
         else:
             try:
                 price = predict_price(
-                    size=size, rooms=rooms, halls=halls,
+                    listing_type=listing_type, size=size, rooms=rooms, halls=halls,
                     building_age=building_age, total_floors=total_floors,
                     floor=floor, sub_type=sub_type, heating_type=heating_type,
                     city=city, county=county)
 
-                mae = package['mae']
+                # средняя ошибка у продажи и аренды своя
+                type_metrics = package['metrics_by_type'][listing_type]
+                mae = type_metrics['MAE']
                 low = max(price - mae, 0)
                 high = price + mae
 
                 st.success('Прогноз готов')
 
                 res1, res2, res3 = st.columns(3)
-                res1.metric('Прогноз цены', f'{price:,.0f} TRY'.replace(',', ' '))
+                res1.metric('Прогноз цены' if is_sale else 'Аренда в месяц',
+                            f'{price:,.0f} TRY'.replace(',', ' '))
                 res2.metric('Вероятный диапазон',
                             f'{low:,.0f} — {high:,.0f}'.replace(',', ' '))
                 res3.metric('Цена за м²', f'{price / size:,.0f} TRY'.replace(',', ' '))
@@ -226,7 +234,7 @@ with tab_predict:
                 mae_text = f'{mae:,.0f}'.replace(',', ' ')
                 st.info('Диапазон построен как «прогноз ± средняя ошибка модели (MAE)». '
                         'Средняя ошибка модели на тестовых данных — '
-                        f'{mae_text} TRY, или {package["mape"]:.1f}%.')
+                        f'{mae_text} TRY, или {type_metrics["MAPE, %"]:.1f}%.')
 
                 if city not in package['top_cities']:
                     st.warning('Этот город не попал в тридцатку самых частых, '
@@ -249,24 +257,34 @@ with tab_dashboard:
 
         st.sidebar.header('Фильтры дашборда')
 
+        dash_type = st.sidebar.radio('Тип объявления', [1, 2],
+                                     format_func=lambda x: package['listing_types'][x])
+
         all_cities = sorted(data['city'].unique())
         picked_cities = st.sidebar.multiselect(
             'Города', all_cities,
             default=[c for c in ['İstanbul', 'Ankara', 'İzmir'] if c in all_cities])
 
-        price_min, price_max = st.sidebar.slider(
-            'Цена, млн TRY', 0.0, 10.0, (0.0, 3.0), step=0.1)
+        # у продажи цены в миллионах, у аренды - в тысячах лир в месяц
+        if dash_type == 1:
+            price_min, price_max = st.sidebar.slider(
+                'Цена, млн TRY', 0.0, 10.0, (0.0, 3.0), step=0.1)
+            price_unit = 1_000_000
+        else:
+            price_min, price_max = st.sidebar.slider(
+                'Аренда в месяц, тыс. TRY', 0.0, 50.0, (0.0, 10.0), step=0.5)
+            price_unit = 1_000
 
         picked_types = st.sidebar.multiselect(
             'Тип жилья', sorted(data['sub_type'].unique()))
 
-        view = data.copy()
+        view = data[data['listing_type'] == dash_type]
         if picked_cities:
             view = view[view['city'].isin(picked_cities)]
         if picked_types:
             view = view[view['sub_type'].isin(picked_types)]
-        view = view[(view['price'] >= price_min * 1_000_000) &
-                    (view['price'] <= price_max * 1_000_000)]
+        view = view[(view['price'] >= price_min * price_unit) &
+                    (view['price'] <= price_max * price_unit)]
 
         if len(view) == 0:
             st.warning('Под выбранные фильтры не подошло ни одного объявления. '
@@ -364,7 +382,8 @@ with tab_help:
     st.subheader('Что делает это приложение')
     st.write(
         'Приложение оценивает рыночную стоимость квартиры или дома по его '
-        'характеристикам. Вы вводите площадь, количество комнат, этаж, возраст '
+        'характеристикам: цену продажи или месячную плату за аренду. Вы выбираете '
+        'тип объявления и вводите площадь, количество комнат, этаж, возраст '
         'здания и расположение — модель машинного обучения возвращает ожидаемую '
         'цену и вероятный диапазон вокруг неё.')
 
@@ -380,6 +399,7 @@ with tab_help:
 
     st.subheader('Описание полей')
     fields = pd.DataFrame([
+        ['Тип объявления', 'Продажа или аренда (плата за месяц)', 'список'],
         ['Площадь, м²', 'Общая площадь объекта', 'от 20 до 1000'],
         ['Комнат', 'Число жилых комнат без гостиной', 'от 0 до 15'],
         ['Гостиных', 'Число гостиных. В Турции планировку пишут как «3+1»', 'от 0 до 5'],
@@ -401,11 +421,14 @@ with tab_help:
         'Модель предсказывает логарифм цены, а результат переводится обратно в лиры. '
         'Это сделано потому, что цены распределены очень несимметрично.')
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric('Средняя ошибка (MAE)',
-              f'{package["mae"]:,.0f} TRY'.replace(',', ' '))
-    m2.metric('Ошибка в процентах (MAPE)', f'{package["mape"]:.1f} %')
-    m3.metric('R²', f'{package["r2"]:.2f}')
+    for listing_type_key, type_name in package['listing_types'].items():
+        type_metrics = package['metrics_by_type'][listing_type_key]
+        st.markdown(f'**{type_name}**')
+        m1, m2, m3 = st.columns(3)
+        m1.metric('Средняя ошибка (MAE)',
+                  f'{type_metrics["MAE"]:,.0f} TRY'.replace(',', ' '))
+        m2.metric('Ошибка в процентах (MAPE)', f'{type_metrics["MAPE, %"]:.1f} %')
+        m3.metric('R²', f'{type_metrics["R2"]:.2f}')
 
     st.caption('Метрики посчитаны на тестовой выборке, которая не использовалась '
                'ни при обучении, ни при подборе гиперпараметров.')
@@ -419,16 +442,16 @@ with tab_help:
         '* **В данных нет части важных признаков:** состояния ремонта, наличия '
         'лифта и парковки, расстояния до центра и до метро. Модель их не видит, '
         'и это главная причина, почему точность ограничена.\n'
-        '* **Средняя ошибка около 20%.** Для типовой квартиры прогноз будет '
+        '* **Средняя ошибка 20–25%.** Для типовой квартиры прогноз будет '
         'достаточно точным, для редких и дорогих объектов — заметно хуже, '
         'потому что таких примеров в обучающих данных мало.\n'
         '* **Города вне списка** сводятся к категории «Другой», и точность по ним падает.\n'
-        '* Модель обучена только на объявлениях **о продаже**. Для аренды она неприменима.')
+        '* **Посуточная аренда** моделью не поддерживается: только продажа и аренда на месяц.')
 
     st.divider()
     st.subheader('О приложении')
     st.markdown(
         f'**Версия:** {APP_VERSION}\n\n'
-        '**Автор:** укажите здесь своё ФИО и группу\n\n'
+        '**Автор:** Баймуратов Данил Азатович, группа 23п1\n\n'
         '**Источник данных:** Zingat, файл `real_estate_data.csv`\n\n'
         '**Исходный код:** notebook `real_estate_price.ipynb` в этой же папке')
