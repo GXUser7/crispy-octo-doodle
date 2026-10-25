@@ -12,7 +12,7 @@ import pandas as pd
 import plotly.express as px
 import streamlit as st
 
-APP_VERSION = '2.0'
+APP_VERSION = '3.0'
 
 # пути считаем от самого файла, чтобы приложение запускалось из любой папки
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,7 +53,14 @@ def load_model():
 def load_data():
     if not os.path.exists(DATA_FILE):
         return None
-    return pd.read_csv(DATA_FILE)
+    data = pd.read_csv(DATA_FILE)
+    # полные названия района и квартала для формы прогноза: в столбце county
+    # редкие районы сложены в «Другой», а признакам расположения нужен настоящий адрес
+    if 'address' in data.columns:
+        parts = data['address'].str.split('/')
+        data['county_name'] = parts.str[1]
+        data['quarter'] = parts.str[2]
+    return data
 
 
 @st.cache_data
@@ -74,15 +81,72 @@ if package is None:
 
 
 # ----------------------------------------------------------------------
+# Признаки расположения — средние цены по train из model.pkl.
+# Код повторяет п. 2.6 notebook-а.
+# ----------------------------------------------------------------------
+LEVELS = {
+    'loc': ['lt', 'city', 'county', 'quarter'],
+    'type': ['lt', 'type', 'type_city', 'type_county', 'type_quarter'],
+    'rooms': ['lt', 'rooms', 'rooms_city', 'rooms_county'],
+}
+
+
+def make_keys(data):
+    # ключ группы - строка вида '1|İstanbul|Kadıköy|Caferağa' (тип объявления|город|район|квартал)
+    address = data['address'].fillna('').str.split('/')
+    city = address.str[0].fillna('')
+    county = city + '|' + address.str[1].fillna('')
+    quarter = county + '|' + address.str[2].fillna('')
+    lt = data['listing_type'].astype(str)
+    sub_type = lt + '|' + data['sub_type'].fillna('?')
+    rooms = lt + '|' + data['room_count'].fillna('?').astype(str)
+    return pd.DataFrame({
+        'lt': lt,
+        'city': lt + '|' + city, 'county': lt + '|' + county, 'quarter': lt + '|' + quarter,
+        'type': sub_type, 'type_city': sub_type + '|' + city,
+        'type_county': sub_type + '|' + county, 'type_quarter': sub_type + '|' + quarter,
+        'rooms': rooms, 'rooms_city': rooms + '|' + city, 'rooms_county': rooms + '|' + county,
+    }, index=data.index)
+
+
+def apply_means(keys, means, levels):
+    # группа, которой не было в train, получает значение уровня выше
+    values = {}
+    for i, level in enumerate(levels):
+        value = keys[level].map(means[level])
+        if i > 0:
+            value = value.fillna(values[levels[i - 1]])
+        values[level] = value
+    return values
+
+
+def location_features(data, tables):
+    keys = make_keys(data)
+    result = pd.DataFrame(index=data.index)
+    for name, levels in LEVELS.items():
+        values = apply_means(keys, tables[name], levels)
+        for level in levels[1:]:
+            result['mean_' + level] = values[level]
+    ppm = apply_means(keys, tables['ppm'], LEVELS['loc'])
+    result['ppm_county'] = ppm['county']
+    result['ppm_quarter'] = ppm['quarter']
+    result['n_quarter'] = keys['quarter'].map(tables['n_quarter']).fillna(0)
+    return result
+
+
+# ----------------------------------------------------------------------
 # Сборка признаков — ровно так же, как при обучении
 # ----------------------------------------------------------------------
 def make_features(listing_type, size, rooms, halls, building_age, total_floors, floor,
-                  sub_type, heating_type, city, county):
+                  sub_type, heating_type, city, county, quarter):
     total_rooms = rooms + halls
 
     row = {
         'listing_type': listing_type,
         'size': size,
+        # форма не пропускает пустую или ошибочную площадь
+        'size_missing': 0,
+        'size_error': 0,
         'building_age_num': building_age,
         'total_floors': total_floors,
         'floor': floor,
@@ -102,12 +166,17 @@ def make_features(listing_type, size, rooms, halls, building_age, total_floors, 
     one = pd.DataFrame([row])
     one = one[package['num_features'] + package['cat_features']]
     one = pd.get_dummies(one, columns=package['cat_features'], dtype=int)
-    one = one.reindex(columns=package['columns'], fill_value=0)
 
-    if package['needs_scaling']:
-        one = pd.DataFrame(package['scaler'].transform(one),
-                           columns=package['columns'])
-    return one
+    # признакам расположения нужен адрес 'город/район/квартал'; если квартал
+    # не выбран, модель возьмёт средние по району
+    if 'location_tables' in package:
+        raw = pd.DataFrame([{'listing_type': listing_type, 'sub_type': sub_type,
+                             'room_count': f'{rooms}+{halls}',
+                             'address': f'{city}/{county}/{quarter or ""}'}])
+        one = pd.concat([one, location_features(raw, package['location_tables'])], axis=1)
+
+    # масштабирование встроено в саму модель
+    return one.reindex(columns=package['columns'], fill_value=0)
 
 
 def predict_price(**kwargs):
@@ -191,14 +260,28 @@ with tab_predict:
         city = st.selectbox('Город', cities,
                             index=cities.index('İstanbul') if 'İstanbul' in cities else 0)
 
-        # районы показываем только те, что реально встречаются в выбранном городе
-        if data is not None:
+        # районы и кварталы показываем только те, что реально встречаются в данных
+        has_address = data is not None and 'county_name' in data.columns
+        if has_address:
+            city_rows = data[data['address'].str.startswith(city + '/', na=False)]
+            in_city = sorted(city_rows['county_name'].dropna().unique())
+        elif data is not None:
             in_city = sorted(data[data['city'] == city]['county'].dropna().unique())
         else:
             in_city = sorted(package['top_counties'])
         if len(in_city) == 0:
             in_city = ['Другой']
         county = st.selectbox('Район', in_city)
+
+        quarter = None
+        if has_address:
+            in_county = sorted(city_rows[city_rows['county_name'] == county]['quarter']
+                               .dropna().unique())
+            quarter = st.selectbox('Квартал', ['Не знаю'] + in_county,
+                                   help='Если квартал не выбран, модель возьмёт '
+                                        'средние цены по району')
+            if quarter == 'Не знаю':
+                quarter = None
 
     st.divider()
 
@@ -214,7 +297,7 @@ with tab_predict:
                     listing_type=listing_type, size=size, rooms=rooms, halls=halls,
                     building_age=building_age, total_floors=total_floors,
                     floor=floor, sub_type=sub_type, heating_type=heating_type,
-                    city=city, county=county)
+                    city=city, county=county, quarter=quarter)
 
                 # средняя ошибка у продажи и аренды своя
                 type_metrics = package['metrics_by_type'][listing_type]
@@ -410,6 +493,7 @@ with tab_help:
         ['Отопление', 'Тип системы отопления из объявления', 'список'],
         ['Город', '30 самых частых городов датасета', 'список'],
         ['Район', 'Районы выбранного города', 'список'],
+        ['Квартал', 'Кварталы выбранного района; можно не выбирать', 'список'],
     ], columns=['Поле', 'Что означает', 'Допустимые значения'])
     st.dataframe(fields, width='stretch', hide_index=True)
 
@@ -442,9 +526,9 @@ with tab_help:
         '* **В данных нет части важных признаков:** состояния ремонта, наличия '
         'лифта и парковки, расстояния до центра и до метро. Модель их не видит, '
         'и это главная причина, почему точность ограничена.\n'
-        '* **Средняя ошибка 20–25%.** Для типовой квартиры прогноз будет '
-        'достаточно точным, для редких и дорогих объектов — заметно хуже, '
-        'потому что таких примеров в обучающих данных мало.\n'
+        '* **Средняя ошибка 21–25%** на новых объектах. Для типовой квартиры прогноз '
+        'будет достаточно точным, для редких и дорогих объектов (фермы, виллы, лофты) — '
+        'заметно хуже, потому что таких примеров в обучающих данных мало.\n'
         '* **Города вне списка** сводятся к категории «Другой», и точность по ним падает.\n'
         '* **Посуточная аренда** моделью не поддерживается: только продажа и аренда на месяц.')
 
